@@ -2,25 +2,37 @@
 # See https://docs.cocotb.org/en/stable/quickstart.html for more info
 
 # defaults
-SIM ?= icarus
-FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v
+PROJECT_SOURCES = tt_um_tshr_k_protocol_emulator.sv protocol_emulator.sv
+
+# The design's top-level module is simulated directly (no tb.v wrapper)
+COCOTB_TOPLEVEL = tt_um_tshr_k_protocol_emulator
 
 ifneq ($(GATES),yes)
 
-# RTL simulation:
-SIM_BUILD				= sim_build/rtl
+# RTL simulation (Verilator for proper SystemVerilog support):
+SIM ?= verilator
+SIM_BUILD = sim_build/rtl
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
+
+# Waveforms: run with `make WAVES=1` to get dump.fst (view with gtkwave or surfer)
+ifeq ($(WAVES),1)
+SIM_BUILD = sim_build/rtl_waves
+COMPILE_ARGS += --trace-fst --trace-structs
+SIM_ARGS += --trace
+endif
 
 else
 
-# Gate level simulation:
-SIM_BUILD				= sim_build/gl
-COMPILE_ARGS    += -DGL_TEST
-COMPILE_ARGS    += -DFUNCTIONAL
-COMPILE_ARGS    += -DSIM
+# Gate level simulation (Icarus, since the PDK cell models use UDPs/timing
+# constructs that Verilator handles poorly):
+SIM ?= icarus
+FST ?= -fst # Use more efficient FST format
+SIM_BUILD = sim_build/gl
+COMPILE_ARGS += -DGL_TEST
+COMPILE_ARGS += -DFUNCTIONAL
+COMPILE_ARGS += -DSIM
 # Cell models for the PDK in $(PDK) (ihp-sg13cmos5l or ihp-sg13g2), e.g. sg13cmos5l_stdcell.v
 PDK ?= ihp-sg13cmos5l
 PDK_CELL_PREFIX = $(patsubst ihp-%,%,$(PDK))
@@ -36,11 +48,7 @@ VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
 endif
 
 # Allow sharing configuration between design and testbench via `include`:
-COMPILE_ARGS 		+= -I$(SRC_DIR)
-
-# Include the testbench sources:
-VERILOG_SOURCES += $(PWD)/tb.v
-TOPLEVEL = tb
+COMPILE_ARGS += -I$(SRC_DIR)
 
 # List test modules to run, separated by commas and without the .py suffix:
 COCOTB_TEST_MODULES = test
