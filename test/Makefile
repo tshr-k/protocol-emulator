@@ -9,6 +9,13 @@ PROJECT_SOURCES = tt_um_tshr_k_protocol_emulator.sv protocol_emulator.sv
 # The design's top-level module is simulated directly (no tb.v wrapper)
 COCOTB_TOPLEVEL = tt_um_tshr_k_protocol_emulator
 
+# `make clean` still loads the simulator's makefile, and cocotb's Verilator makefile
+# aborts if verilator isn't on PATH. The TT gate-level CI job runs a plain
+# `make clean` (no GATES=yes) with only Icarus installed, so use Icarus for clean.
+ifeq ($(MAKECMDGOALS),clean)
+SIM ?= icarus
+endif
+
 ifneq ($(GATES),yes)
 
 # RTL simulation (Verilator for proper SystemVerilog support):
