@@ -27,7 +27,7 @@ One clock domain at a 48 MHz target (one cycle = 20.83 ns), and 16 engine-visibl
 
 ## Engine
 
-Two identical engines (E0, E1), each a small PIO-like machine with 16-bit instructions, plus one new idea: a deadline register D and a `.at` flag that makes a pin action happen on an exact cycle.
+Two identical engines (E0, E1), each a small PIO-like machine with 16-bit instructions, plus one new idea: a deadline register D and a `.at` flag that makes any instruction act on an exact cycle.
 
 **Registers (per engine)**
 
@@ -45,34 +45,84 @@ Two identical engines (E0, E1), each a small PIO-like machine with 16-bit instru
 
 Host-written config per engine: OUT, SET and IN pin windows (base + count), the JMP pin, the open-drain mask, shift directions, autopull/autopush thresholds, and the late policy (flag or halt).
 
-**Instruction encoding:** bits 15:12 are the opcode; bit 11 is `.at` (or `.to` on WAIT); bits 10:0 are operands.
+**How data moves.** Words from the host arrive in the TX FIFO. PULL, or autopull once the output shift register (OSR) has shifted out a host-set number of bits, loads the next word into OSR, and OUT shifts 1–16 bits at a time out of OSR to pins or a register. In the other direction, IN shifts 1–16 bits from pins or a register into the input shift register (ISR), and PUSH, or autopush at a threshold, moves ISR into the RX FIFO for the host. Each shift register's direction (MSB or LSB first) is host config. Pins are reached through windows: an n-bit OUT, SET or IN touches pins base to base + n − 1 of its window, so one program works on whichever pins the host maps it to.
 
-| Op | Mnemonic | Operands | Stalls when |
-| --- | --- | --- | --- |
-| 0 | JMP | condition (always, X==0, X--, Y--, PIN, !OSRE, TIMEOUT, MATCH), 8-bit address | Never |
-| 1 | WAIT\[.to\] | polarity, source (pin, event, PPS), index | Until true; with `.to`, until D at most (sets TIMEOUT) |
-| 2 | IN\[.at\] | source (PINS, X, Y, NULL), 1–16 bits | `.at` until D; autopush to a full FIFO |
-| 3 | OUT\[.at\] | destination (PINS, PINDIRS, X, Y, NULL, DADD, PC), 1–16 bits | `.at` until D; autopull from an empty FIFO |
-| 4 | SET\[.at\] | destination (PINS, PINDIRS, X, Y), 8-bit immediate | `.at` until D |
-| 5 | MOV | destination, operation (none, invert, bit-reverse), source | Never |
-| 6 | PUSH / PULL | block, if-full / if-empty | If blocking and the FIFO is full / empty |
-| 7 | TIME | START (D ← now + P), ADV (D ← D + P), WAITD (wait until D, then D += P), STAMP (log the time + X to the stream), SETP (P ← Y:X) | WAITD until D |
-| 8 | EVT | RAISE / CLEAR shared event *i*, IRQ to host | Never |
-| 9 | ADDI | X or Y, signed 8-bit immediate | Never |
-| A | CRC | RESET (load the initial value), SRC (feed from OSR or ISR shifts), READ (result to ISR, X or Y) | Never |
-| B–F | reserved | Room for line-coding ops later | — |
+**Instruction format**
 
-`OUT DADD` adds the shifted-out bits to D. That one destination is what lets replay run as an ordinary program (see Match-and-act and replay).
+```
+ 15      12   11   10    8   7                0
+[  opcode  ] [.at] [   A   ] [        B        ]
+```
+
+- **A (bits 10:8)** is a selector: the JMP condition, a destination or source, or a sub-operation.
+- **B (bits 7:0)** is data: the JMP address, an 8-bit immediate, a bit count in bits 3:0 (0 means 16), a second selector, or a set of flags.
+- **Bit 11** is `.at` on every instruction except WAIT, where it is `.to`. A `.at` instruction waits until the counter reaches D, acts on that cycle, then adds P to D (timing contract, items 2–5). Any instruction can be timed: `set.at` for a pin edge, `evt.at` to wake the other engine on an exact cycle, `time.at stamp` to log exactly at D.
+- Bits shown as 0 are ignored by the hardware, and the assembler writes them as 0. Reserved opcodes and reserved field values halt the engine and set ILLEGAL in STATUS.
+
+| Op | Instruction | Bit 11 | Bits 10:8 | Bits 7:0 |
+| --- | --- | --- | --- | --- |
+| `0` | JMP | `.at` | condition | address |
+| `1` | WAIT | `.to` | \[10\] polarity, \[9:8\] source | \[3:0\] index |
+| `2` | IN | `.at` | source | \[3:0\] bit count |
+| `3` | OUT | `.at` | destination | \[3:0\] bit count |
+| `4` | SET | `.at` | destination | 8-bit immediate |
+| `5` | MOV | `.at` | destination | \[4:3\] operation, \[2:0\] source |
+| `6` | PUSH / PULL | `.at` | 0 = PUSH, 1 = PULL | \[1\] if-full / if-empty, \[0\] block |
+| `7` | TIME | `.at` | 0 | \[3\] ADD, \[2\] NOW, \[1\] SETP, \[0\] STAMP |
+| `8` | EVT | `.at` | 0 = RAISE, 1 = CLEAR | \[4\] IRQ, \[3:0\] event mask |
+| `9` | ADDI | `.at` | destination (X or Y only) | signed 8-bit immediate |
+| `A` | CRC | `.at` | READ destination (X, Y, OSR or ISR only) | \[4:3\] SRC, \[2\] HIGH, \[1\] READ, \[0\] RESET |
+| `B`–`F` | reserved | — | — | Room for line-coding ops later |
+
+For example, `set pins, 1` is `0x4001`, `out.at pins, 1` is `0x3801`, `jmp x--, 5` is `0x0205`, `pull block` is `0x6101` and `time start` is `0x700C`.
+
+**Shared operand encodings.** OUT, SET, MOV, ADDI and CRC READ share one destination numbering, and IN and MOV share one source numbering. PINS, OSR, X, Y and ISR have the same value in both, so the decoder can route the field straight to the register file. OUT is the one exception: shifting OSR back into itself is meaningless, so for OUT value 1 means NULL.
+
+| Value | Destination | Source |
+| --- | --- | --- |
+| 0 | PINS: the instruction's pin window (OUT window for OUT and MOV, SET window for SET) | PINS: the IN window |
+| 1 | OSR: its shift count resets, so it is full again (for OUT: NULL, bits discarded) | OSR |
+| 2 | X | X |
+| 3 | Y | Y |
+| 4 | PINDIRS: the same window as PINS, 1 = output | NULL: zeros |
+| 5 | DADD: D ← D + (value << SCALE) | FLAGS, zero-extended |
+| 6 | PC: jump to the value | reserved |
+| 7 | ISR: its shift count becomes the number of bits written | ISR |
+
+| Value | JMP condition | Jumps when |
+| --- | --- | --- |
+| 0 | *(none)* | Always |
+| 1 | `!x` | X is 0 |
+| 2 | `x--` | X is not 0; X is decremented either way |
+| 3 | `y--` | Y is not 0; Y is decremented either way |
+| 4 | `pin` | The JMP pin is high |
+| 5 | `!txe` | The TX FIFO is not empty |
+| 6 | `timeout` | TIMEOUT is set; the jump clears it |
+| 7 | `match` | MATCH is set; the jump clears it |
+
+**What each instruction does**
+
+- **JMP** `jmp[.at] [condition,] target`: jumps to an 8-bit address when the condition holds. A taken jump costs one extra cycle. `!txe` lets a transmitter go straight to the next frame without re-anchoring its schedule (see the UART example).
+- **WAIT** `wait[.to] polarity, source, index`: stalls until a signal equals the polarity (0 or 1). Source 0 is pin P*index* (0–15; the output-only P12–P15 read back what they drive). Source 1 is shared event *index* (0–3; 4–15 are reserved); a wait for 1 clears the event as it ends, so the next wait needs a new RAISE. Source 2 is the synchronised PPS input, with the index ignored, and source 3 is reserved. With `.to`, the wait also ends when the counter reaches D: TIMEOUT is set if it ended on D and cleared if it ended on the signal. D is not advanced either way.
+- **IN** `in[.at] source, count`: shifts *count* bits (1–16) from the source into ISR, starting at the IN window's base pin for PINS. With autopush on, a full ISR then moves to the RX FIFO, stalling while the FIFO is full.
+- **OUT** `out[.at] destination, count`: shifts *count* bits out of OSR to the destination (table above). With autopull on, an empty OSR first refills from the TX FIFO, stalling while the FIFO is empty. `out null` discards bits, and `out dadd` is what lets replay run as an ordinary program (see Match-and-act and replay).
+- **SET** `set[.at] destination, value`: writes an 8-bit immediate, zero-extended. PINS and PINDIRS reach up to 8 pins of the SET window. `set.at pins` is the usual way to make a clock edge or start bit on an exact cycle.
+- **MOV** `mov[.at] destination, [operation] source`: copies a 16-bit value, unchanged (0), inverted (1, written `~`) or bit-reversed (2, written `::`); operation 3 is reserved. Unlike OUT and IN it does not shift OSR or ISR. `mov osr, x` reloads OSR without the TX FIFO, for example to send the same word again.
+- **PUSH / PULL** `push [iffull] [block]`, `pull [ifempty] [block]`: PUSH moves ISR into the RX FIFO and clears ISR; PULL loads OSR from the TX FIFO. With block, they stall while the FIFO is full (PUSH) or empty (PULL); without it, they do nothing in that case. `iffull` / `ifempty` make them do nothing unless ISR has reached the autopush threshold, or OSR the autopull threshold.
+- **TIME** `time[.at] flags`: manages the deadline. Any mix of flags is allowed, applied in this order: STAMP logs the current time and X to the stream; SETP loads P from {Y\[7:0\], X}; NOW sets D to the current time; ADD adds P to D. The assembler also accepts `start` (NOW + ADD, so D ← now + P, which anchors a schedule), `adv` (ADD) and `waitd`, which is `time.at` with no flags: wait until D, then D += P.
+- **EVT** `evt[.at] raise|clear, mask [, irq]`: sets or clears any of the four shared event flags at once. Both engines see them, WAIT waits on them and the matcher can raise them. With IRQ it also raises the host IRQ (if enabled in IRQ\_EN); an empty mask with IRQ just interrupts the host.
+- **ADDI** `addi[.at] x|y, value`: adds a signed 8-bit immediate (−128 to 127) to X or Y, wrapping at 16 bits.
+- **CRC** `crc[.at] flags [, destination]`: controls the engine's LFSR, applying its flags in this order. READ copies 16 bits of the CRC (bits 15:0, or 31:16 with HIGH) to X, Y, OSR or ISR; without READ, bits 10:8 are ignored. RESET loads CRC\_INIT. A nonzero SRC chooses what feeds it from then on: 1 = bits shifted through OSR, 2 = through ISR, 3 = nothing (the value after reset). `crc read|reset, x` finishes one frame and starts the next in one instruction.
 
 ## Timing contract
 
 Every guarantee is stated in cycles of `clk`. Firmware and tests rely on these, and the formal proofs check them.
 
-1. **Issue:** each instruction takes 1 cycle, and a taken JMP takes 2. Program SRAM reads are synchronous, so a taken branch costs one bubble. Only stalls add more.
-2. **Deadline actions:** a `.at` instruction stalls until the cycle where the counter reaches D. Its register update happens on that cycle, and the pad changes one cycle later (a fixed output latency of 1).
+1. **Issue:** each instruction takes 1 cycle, and one that changes PC (a taken JMP, or a write to PC) takes 2. Program SRAM reads are synchronous, so a jump costs one bubble. Only stalls add more.
+2. **Deadline actions:** a `.at` instruction stalls until the cycle where the counter reaches D and acts on that cycle; a pin change reaches the pad one cycle later (a fixed output latency of 1). If the instruction also has to wait for a FIFO, it acts on the first cycle at or after D when the FIFO allows.
 3. **Wrap-safe compare:** D counts as reached when (counter − D), read as signed 32-bit, is ≥ 0. Deadlines can sit up to 2^31 cycles (44.7 s) ahead.
-4. **Advance:** after each `.at` action, D ← D + P. With P = 0, D stays put.
-5. **Late:** if D has already passed when a `.at` instruction issues, the action happens at once, LATE is set and a LATE marker goes into the stream. With the late policy set to halt, the engine stops before acting instead.
+4. **Advance:** after each `.at` instruction, D ← D + P, applied after the instruction's own effect on D. With P = 0, D stays put.
+5. **Late:** if a `.at` instruction acts on a cycle after D (it issued after D, or a FIFO held it past D), LATE is set and a LATE marker goes into the stream. With the late policy set to halt, the engine stops before acting instead.
 6. **Timeout:** `WAIT.to` ends on its condition or on D, whichever comes first. Ending on D sets TIMEOUT and does not advance D.
 7. **Inputs:** pin values seen by engines and capture are 2 cycles old (the synchroniser). The optional 3-sample glitch filter adds 1 more. Capture reports raw timestamps; the host subtracts the constant.
 8. **Cross-engine:** both engines read one counter, so `.at` actions with the same D land on the same cycle.
@@ -154,7 +204,7 @@ The host (the demo board's RP2040) talks SPI mode 0, MSB first, at up to 6 MHz. 
 | --- | --- | --- |
 | `0x00` | ID | Chip ID and spec version (read-only) |
 | `0x01` | CTRL | Engine run bits, capture enable, matcher enable |
-| `0x02` | STATUS | Halted, LATE and TIMEOUT per engine, buffer level, overflow (read-only) |
+| `0x02` | STATUS | Halted, LATE, TIMEOUT and ILLEGAL per engine, buffer level, overflow (read-only) |
 | `0x03`, `0x04` | IRQ\_EN, IRQ\_STATUS | Which events raise the IRQ pin; writing 1 to an IRQ\_STATUS bit clears it |
 | `0x05` | CAP\_CFG | Capture pin mask, glitch filter enable |
 | `0x06` | BUF\_CFG | Shared buffer used for capture or for replay |
@@ -168,25 +218,28 @@ D and PC are writable only while that engine is halted; X, Y, FLAGS and FIFO lev
 
 ## Worked example: UART TX
 
-UART 8N1 at 115,200 baud is ten instructions, and every edge lands on its exact cycle however long the loop body takes.
+UART 8N1 at 115,200 baud is thirteen instructions, and every edge lands on its exact cycle however long the loop body takes.
 
 The config is P = 417 cycles (48 MHz / 115,200 = 416.67, so 0.08% slow), OUT and SET windows on P0, and OSR shifting right for LSB first.
 
 ```
         set    pins, 1     ; line idles high
-frame:  pull   block       ; next byte from the TX FIFO
-        time   start       ; D <- now + P: re-anchor after any idle time
-        set    x, 7        ; 8 data bits
+idle:   pull   block       ; wait for the next byte
+        time   start       ; D <- now + P: re-anchor after idle time
+frame:  set    x, 7        ; 8 data bits
         set.at pins, 0     ; start bit at D, then D += P
 bit:    out.at pins, 1     ; data bit at D, then D += P
         jmp    x--, bit
         set.at pins, 1     ; stop bit at D, then D += P
-        time   waitd       ; hold the stop bit for a full period
+        jmp    !txe, next  ; another byte queued: keep the schedule
+        time.at            ; hold the stop bit for a full period
+        jmp    idle
+next:   pull   block
         jmp    frame
 ```
 
 - The loop body (`out.at` + a taken `jmp`) costs 3 cycles against a 417-cycle bit, so it never runs late.
-- Re-anchoring each frame adds one idle bit between back-to-back bytes (11 bit times per byte, not 10). A "TX FIFO not empty" jump condition would remove that; it's listed under decisions.
+- `jmp !txe` chains back-to-back bytes at exactly 10 bit times each. The schedule re-anchors only after the line has gone idle.
 - SPI has the same shape, with P as half a clock period: an `out.at` for data, then a `set.at` for the clock edge. I2C adds open-drain pins and `WAIT.to` for clock stretching and missing ACKs.
 
 ## Area budget
@@ -222,7 +275,7 @@ The first three shape the rest of the design, so they are settled first; the oth
 | Deadline compare width | 32 bits (44.7 s horizon) vs the full 48 | 32 | Needing schedules more than 44 s ahead without host help |
 | Late policy default | Flag and continue vs halt | Flag | A target where a late edge does more harm than stopping |
 | Side-set | None vs PIO-style side-set | None (`.at` covers most uses) | Fast SPI needing a pin change and another operation in one cycle |
-| Back-to-back frames | Re-anchor every frame vs a "TX FIFO not empty" jump | Re-anchor | Throughput mattering; it costs a fourth condition bit in JMP |
+| Back-to-back frames | Re-anchor every frame vs a "TX FIFO not empty" jump | `!txe` jump condition, decided (it replaced `!OSRE`) | Needing a jump on OSR empty; autopull covers most of those uses |
 | Clock rate | 48 MHz vs higher | 48 MHz | Timing slack at final hardening, or attempting 10BASE-T |
 | Replay | Firmware on an engine vs a dedicated unit | Firmware | Needing replay edges closer than about 5 cycles |
 | Matcher power | One masked pattern vs two or more pattern slots OR'd together, plus a range compare on one byte | One pattern; both added once v0 fits | Triggers like "write or erase command" or "any address ≥ 0x80"; both are cheap |
